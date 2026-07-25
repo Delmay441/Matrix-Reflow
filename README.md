@@ -1,6 +1,7 @@
 # Matrix Reflow
-
 A native Windows 10/11 screensaver recreation of the *Matrix* digital rain — built with Direct3D 11 and DirectWrite, with bloom, HDR, and a toggleable CRT emulation pass on top.
+
+https://github.com/user-attachments/assets/13866fe0-02cc-4718-95b1-a8180e8538bc
 
 Matrix Reflow is based on DigitalChewie's Windows port of [**Modern Matrix**](https://github.com/DigitalChewie/ModernMatrixScreensaver), a macOS/Metal recreation of XScreenSaver's legendary **GLMatrix**. It's inspired by [Rezmason's](https://github.com/Rezmason/matrix) beloved WebGL Matrix rain — one of the definitive modern takes on the effect.
 
