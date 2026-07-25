@@ -2,11 +2,11 @@
 
 A native Windows 10/11 screensaver recreation of the *Matrix* digital rain — built with Direct3D 11 and DirectWrite, with bloom, HDR, and a toggleable CRT emulation pass on top.
 
-Matrix Reflow is based on DigitalChewie's Windows port of [**Modern Matrix**](https://github.com/DigitalChewie), a macOS/Metal recreation of XScreenSaver's legendary **GLMatrix**. It's inspired by [Rezmason's](https://github.com/Rezmason/matrix) beloved WebGL Matrix rain — one of the definitive modern takes on the effect.
+Matrix Reflow is based on DigitalChewie's Windows port of [**Modern Matrix**](https://github.com/DigitalChewie/ModernMatrixScreensaver), a macOS/Metal recreation of XScreenSaver's legendary **GLMatrix**. It's inspired by [Rezmason's](https://github.com/Rezmason/matrix) beloved WebGL Matrix rain — one of the definitive modern takes on the effect.
 
 It's still built on the shared Modern Matrix "engine" (`mmcore`), the portable C simulation core that also drives the macOS version — but Matrix Reflow has diverged substantially enough from both the original Mac version and DigitalChewie's Windows port (in rendering, effects, and settings) that it's grown into its own thing under its own name, rather than staying a straight port.
 
-Glyphs are rasterized at build time from an embedded font into a fixed-cell atlas via DirectWrite/Direct2D — mirroring the macOS Core Text atlas — so nothing needs to be installed system-wide and there's no runtime font dependency.
+Glyphs are rasterized at build time from Rezmason's original Matrix-Code.ttf font into a fixed-cell atlas via DirectWrite/Direct2D — mirroring the macOS Core Text atlas — so nothing needs to be installed system-wide and there's no runtime font dependency.
 
 The renderer paces itself to the display's refresh rate (with tearing/VRR support for G-Sync/FreeSync), uses MMCSS + a raised timer resolution for smooth frame pacing, and multi-monitor `/s` runs spin up one window and renderer per physical display.
 
