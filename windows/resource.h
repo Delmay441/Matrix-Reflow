@@ -47,3 +47,17 @@
 #define IDC_COLUMN_GAPS     1037
 #define IDC_EXTRA_CONTRAST_HEADS 1038
 #define IDC_CRT_EMULATION   1039
+
+// Bolded section/slider titles (see BoldenTitles() in config.cpp).
+#define IDC_TITLE_SPEED      1040
+#define IDC_TITLE_LENGTH     1041
+#define IDC_TITLE_CURVATURE  1042
+#define IDC_TITLE_DEPTH      1043
+#define IDC_TITLE_GLOW       1044
+#define IDC_TITLE_CAMSPEED   1045
+#define IDC_TITLE_MUTATION   1046
+#define IDC_TITLE_COLORTHEME 1047
+#define IDC_TITLE_PROFILES   1048
+#define IDC_TITLE_GLYPHREND  1049
+#define IDC_TITLE_DENSITY 	 1050
+#define IDC_TITLE_SIZE       1051

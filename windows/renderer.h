@@ -54,6 +54,7 @@ private:
     void DrawScene();
     void DrawPost();
     void DrawOverlay();
+    void UpdateFrameTarget();
 
     HWND hwnd_ = nullptr;
     UINT width_ = 1, height_ = 1;
@@ -64,6 +65,19 @@ private:
     ComPtr<ID3D11RenderTargetView> backRTV_;
     DXGI_FORMAT swapFormat_ = DXGI_FORMAT_B8G8R8A8_UNORM;
     HANDLE frameWaitable_ = nullptr;
+    bool tearingSupported_ = false;   // true if the adapter supports DXGI_PRESENT_ALLOW_TEARING (needed for VRR/G-Sync/FreeSync while windowed)
+
+    // With tearing/VRR presents, Present() no longer blocks on vblank, so
+    // nothing paces the loop -- without this we render as fast as the GPU
+    // allows (1000+ fps, full power draw) instead of matching the display.
+    // targetFrameSeconds_ > 0 means RenderFrame() self-paces to that cadence
+    // before doing any GPU work; see UpdateFrameTarget().
+    LARGE_INTEGER qpcFreq_{};
+    LARGE_INTEGER lastFrameQpc_{};
+    double targetFrameSeconds_ = 0.0;
+    bool highResTimerActive_ = false;   // whether timeBeginPeriod(1) is currently in effect (paired in Shutdown)
+    double fpsWindowElapsed_ = 0.0;
+    int    fpsWindowFrames_ = 0;
 
     bool headless_ = false;
     ComPtr<ID3D11Texture2D> finalTex_;

@@ -3,6 +3,7 @@
 #include <DirectXMath.h>
 #include <dxgi1_6.h>
 #include <wincodec.h>
+#include <mmsystem.h>
 #include <string>
 #include <cstring>
 #include <cstdio>
@@ -11,19 +12,27 @@
 #include <vector>
 #include <algorithm>
 
+#pragma comment(lib, "winmm.lib")
+
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
 static UINT maxu(UINT a, UINT b) { return a > b ? a : b; }
 
-static UINT ComputePresentInterval(bool batterySaver)
+static UINT GetDisplayRefreshHz()
 {
-    if (!batterySaver) return 1;
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
     UINT hz = 60;
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
         hz = dm.dmDisplayFrequency;
+    return hz;
+}
+
+static UINT ComputePresentInterval(bool batterySaver)
+{
+    if (!batterySaver) return 1;
+    UINT hz = GetDisplayRefreshHz();
     UINT interval = (hz + 59) / 60;   // round up so effective fps stays at or below 60
     return interval < 1 ? 1 : interval;
 }
@@ -86,12 +95,25 @@ bool Renderer::InitCore()
 
     EnsureInstanceBufferCapacity(mm_sim_max_instances(sim_));
 	presentInterval_ = ComputePresentInterval(settings_.batterySaver != 0);
+    QueryPerformanceFrequency(&qpcFreq_);
+    QueryPerformanceCounter(&lastFrameQpc_);
+    UpdateFrameTarget();
+
+    // Default Windows scheduler timer granularity is ~15.6ms, which is far
+    // too coarse for the frame-pacing Sleep() in RenderFrame() -- at 144Hz
+    // the whole frame budget is only ~6.9ms, so an occasional oversized
+    // Sleep() would blow well past the target and read as a stutter/fps
+    // drop even though nothing was actually slow. Request 1ms resolution
+    // for the process's lifetime (paired with timeEndPeriod in Shutdown).
+    if (timeBeginPeriod(1) == TIMERR_NOERROR) highResTimerActive_ = true;
+
     ready_ = true;
     return true;
 }
 
 void Renderer::Shutdown()
 {
+    if (highResTimerActive_) { timeEndPeriod(1); highResTimerActive_ = false; }
     if (sim_) { mm_sim_destroy(sim_); sim_ = nullptr; }
     if (frameWaitable_) { CloseHandle(frameWaitable_); frameWaitable_ = nullptr; }
     d2dTargets_[0].Reset();
@@ -128,6 +150,24 @@ bool Renderer::CreateDeviceAndSwapChain(HWND hwnd)
         MMLog("HDR display detected -> FP16 scRGB swapchain");
     }
 
+    // Tearing support is what lets us present with SyncInterval 0 instead of
+    // waiting for vblank -- required for G-Sync/FreeSync to actually engage
+    // while running windowed/borderless (as this screensaver's fullscreen
+    // popup window does) rather than fighting a fixed vsync cadence. Falls
+    // back to plain vsync-paced Present on older adapters/drivers that don't
+    // report support.
+    tearingSupported_ = false;
+    {
+        ComPtr<IDXGIFactory5> factory5;
+        if (SUCCEEDED(factory.As(&factory5))) {
+            BOOL allowTearing = FALSE;
+            if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                          &allowTearing, sizeof(allowTearing)))) {
+                tearingSupported_ = allowTearing != FALSE;
+            }
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC1 sc{};
     sc.Width  = width_;
     sc.Height = height_;
@@ -138,7 +178,8 @@ bool Renderer::CreateDeviceAndSwapChain(HWND hwnd)
     sc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sc.Scaling     = DXGI_SCALING_STRETCH;
     sc.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
-    sc.Flags       = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    sc.Flags       = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                    | (tearingSupported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     MM_CHECK(factory->CreateSwapChainForHwnd(device_.Get(), hwnd, &sc, nullptr, nullptr, &swap_));
 
     ComPtr<IDXGISwapChain2> swap2;
@@ -314,11 +355,26 @@ bool Renderer::CreateBuffersAndStates()
     return true;
 }
 
+void Renderer::UpdateFrameTarget()
+{
+    // Battery-saver mode already paces itself via a real vsync SyncInterval
+    // (see ComputePresentInterval), so no extra self-pacing is needed there.
+    // Otherwise, when presenting with tearing for VRR, Present() no longer
+    // blocks us to the display's cadence -- so match it ourselves here
+    // instead, to avoid burning GPU/CPU rendering far more frames than the
+    // monitor (or the person watching) can actually use. This still lets
+    // each frame's actual present timing vary with VRR rather than locking
+    // to a fixed vsync wait; it just stops the loop from running unbounded.
+    const bool useTearingPresent = tearingSupported_ && !settings_.batterySaver;
+    targetFrameSeconds_ = useTearingPresent ? (1.0 / (double)GetDisplayRefreshHz()) : 0.0;
+}
+
 void Renderer::Apply(const MMSettings& settings)
 {
     if (!ready_) { settings_ = settings; return; }
     settings_ = settings;
     presentInterval_ = ComputePresentInterval(settings_.batterySaver != 0);
+    UpdateFrameTarget();
     if (settings_.depthAmount <= 0.0) forwardTravel_ = 0.0f;
     mm_sim_set_camera_travel(sim_, forwardTravel_);
     MMSettings ms = settings_;
@@ -339,7 +395,8 @@ void Renderer::Resize(UINT width, UINT height)
 
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
     HRESULT hr = swap_->ResizeBuffers(0, width_, height_, DXGI_FORMAT_UNKNOWN,
-                                       DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+                                       DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                                       | (tearingSupported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
     if (FAILED(hr)) { ready_ = false; return; }
     if (frameWaitable_) { CloseHandle(frameWaitable_); frameWaitable_ = nullptr; }
     ComPtr<IDXGISwapChain2> swap2;
@@ -556,13 +613,51 @@ bool Renderer::RenderFrame(float dt)
 {
     if (!ready_) return false;
 
+    // Battery-saver mode intentionally caps fps by presenting at a multiple
+    // of the display's refresh (see ComputePresentInterval) -- that's a
+    // fixed cadence, so it keeps using a real SyncInterval. Otherwise, if
+    // the adapter supports it, present with SyncInterval 0 + ALLOW_TEARING
+    // so the display's own G-Sync/FreeSync (VRR) can vary the refresh to
+    // match each frame instead of us forcing a fixed vsync-paced cadence.
+    const bool useTearingPresent = tearingSupported_ && !settings_.batterySaver;
+    const UINT syncInterval = useTearingPresent ? 0 : presentInterval_;
+    const UINT presentFlags = useTearingPresent ? DXGI_PRESENT_ALLOW_TEARING : 0;
+
     if (swap_ && isOccluded_) {
-        HRESULT hr = swap_->Present(presentInterval_, 0);
+        HRESULT hr = swap_->Present(syncInterval, presentFlags);
         if (hr == DXGI_STATUS_OCCLUDED) {
             Sleep(10); 
             return true;
         }
         isOccluded_ = false;
+    }
+
+    // Present() doesn't block us to vblank when using tearing (that's the
+    // whole point, for VRR) -- so pace the loop ourselves to the display's
+    // refresh here instead, otherwise we'd render as fast as the GPU allows.
+    // This still leaves each individual Present's actual timing free to vary
+    // (that's what lets VRR do its job); it just stops us from doing
+    // GPU/CPU work for far more frames than anyone can see.
+    if (targetFrameSeconds_ > 0.0) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double elapsed = double(now.QuadPart - lastFrameQpc_.QuadPart) / double(qpcFreq_.QuadPart);
+        double remaining = targetFrameSeconds_ - elapsed;
+        if (remaining > 0.0) {
+            // Sleep off the bulk of the wait (coarse, but frees up the CPU/GPU),
+            // then spin the last couple ms -- Sleep()'s scheduler granularity
+            // (~1-15ms) makes it unreliable for hitting the target precisely.
+            const double kSpinWindow = 0.002;
+            if (remaining > kSpinWindow)
+                Sleep((DWORD)((remaining - kSpinWindow) * 1000.0));
+            do {
+                QueryPerformanceCounter(&now);
+                elapsed = double(now.QuadPart - lastFrameQpc_.QuadPart) / double(qpcFreq_.QuadPart);
+            } while (elapsed < targetFrameSeconds_);
+        }
+        lastFrameQpc_ = now;
+    } else {
+        QueryPerformanceCounter(&lastFrameQpc_);
     }
 
     time_ += dt;
@@ -599,14 +694,31 @@ bool Renderer::RenderFrame(float dt)
         simAccumulator_ -= kTargetTimeStep;       
     }
 
-    if (dt > 0) { double inst = 1.0 / dt; fps_ = (fps_ == 0) ? inst : fps_ * 0.9 + inst * 0.1; }
+    // A per-frame 1/dt with light smoothing reacts to every bit of normal,
+    // imperceptible scheduling jitter -- at high refresh rates that noise
+    // gets amplified into a visibly "dropping" counter even when nothing is
+    // actually slow. Instead, average frame count over a short window and
+    // update the displayed value a couple times a second; this reports the
+    // true average and doesn't react to single-frame variance at all.
+    if (dt > 0) {
+        fpsWindowElapsed_ += dt;
+        ++fpsWindowFrames_;
+        const double kFpsUpdateInterval = 0.5;
+        if (fpsWindowElapsed_ >= kFpsUpdateInterval) {
+            fps_ = fpsWindowFrames_ / fpsWindowElapsed_;
+            fpsWindowElapsed_ = 0.0;
+            fpsWindowFrames_ = 0;
+        } else if (fps_ == 0.0) {
+            fps_ = 1.0 / dt;   // seed a reasonable value before the first window completes
+        }
+    }
 
     DrawScene();
     DrawPost();
     DrawOverlay();
     if (headless_) { ctx_->Flush(); return true; }
 
-    HRESULT hr = swap_->Present(1, 0);
+    HRESULT hr = swap_->Present(syncInterval, presentFlags);
     
     if (hr == DXGI_STATUS_OCCLUDED) {
         isOccluded_ = true;

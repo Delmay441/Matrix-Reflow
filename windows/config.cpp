@@ -33,6 +33,56 @@ static INT_PTR CALLBACK PageSlidersProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK PageOptionsProc(HWND, UINT, WPARAM, LPARAM);
 static void ApplyPreview();
 
+// --- bold section/slider titles -----------------------------------------------
+// .rc dialog templates only carry one FONT per template, so the "bold title"
+// look is applied at runtime instead: derive a bold variant of the dialog's
+// own font and re-font just the title statics (all given their own control
+// IDs in mm.rc for exactly this purpose).
+static HFONT g_boldFont = nullptr;
+
+// Shared solid-white brush both tab pages paint their background with, so
+// the page body matches the white "page" area the themed tab control (v6
+// common controls) already draws around/behind IDC_TAB -- otherwise the
+// pages default to COLOR_BTNFACE (the usual dialog gray), which visibly
+// seams against the tab control's own white body.
+static HBRUSH g_whiteBrush = nullptr;
+
+static void EnsureWhiteBrush()
+{
+    if (!g_whiteBrush) g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+}
+
+static const int kPage1TitleIds[] = {
+    IDC_TITLE_SPEED, IDC_TITLE_DENSITY, IDC_TITLE_SIZE, IDC_TITLE_LENGTH,
+    IDC_TITLE_CURVATURE, IDC_TITLE_DEPTH, IDC_TITLE_GLOW, IDC_TITLE_CAMSPEED,
+    IDC_TITLE_MUTATION,
+};
+static const int kPage2TitleIds[] = {
+    IDC_TITLE_COLORTHEME, IDC_TITLE_PROFILES, IDC_TITLE_GLYPHREND,
+};
+
+static void BoldenTitles(HWND dlg)
+{
+    if (!g_boldFont) {
+        HFONT hDlgFont = (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0);
+        LOGFONTW lf{};
+        if (hDlgFont && GetObjectW(hDlgFont, sizeof(lf), &lf)) {
+            lf.lfWeight = FW_BOLD;
+            g_boldFont = CreateFontIndirectW(&lf);
+        }
+    }
+    if (!g_boldFont) return;
+
+    for (int id : kPage1TitleIds) {
+        HWND c = GetDlgItem(g_page1, id);
+        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)g_boldFont, TRUE);
+    }
+    for (int id : kPage2TitleIds) {
+        HWND c = GetDlgItem(g_page2, id);
+        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)g_boldFont, TRUE);
+    }
+}
+
 // --- color presets -------------------------------------------------------------
 // The last entry ("Custom") is a sentinel, never applied directly -- it's what
 // the combo shows once the user hand-picks a color that doesn't match a preset.
@@ -250,7 +300,7 @@ static void PositionPages(HWND dlg)
     if (!tab) return;
     RECT r; GetWindowRect(tab, &r);
     MapWindowPoints(nullptr, dlg, (POINT*)&r, 2);
-    r.left += 4; r.right -= 4; r.top += 22; r.bottom -= 6;
+    r.left += 4; r.right -= 4; r.top += 24; r.bottom -= 6;
     int w = r.right - r.left, h = r.bottom - r.top;
     if (g_page1) MoveWindow(g_page1, r.left, r.top, w, h, TRUE);
     if (g_page2) MoveWindow(g_page2, r.left, r.top, w, h, TRUE);
@@ -287,17 +337,22 @@ static INT_PTR CALLBACK PageSlidersProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         return TRUE;
     }
     
-    // Native paint override to force the static text to render in red
+    // Paint this page's own body white (see g_whiteBrush comment above).
+    case WM_CTLCOLORDLG:
+        EnsureWhiteBrush();
+        return (INT_PTR)g_whiteBrush;
+
+    // Static text (titles, Slow/Fast labels, the glyph-scale warning) needs
+    // its background routed through the same white brush, or each label
+    // paints its own little gray rectangle against the now-white page.
     case WM_CTLCOLORSTATIC: {
         HDC hdcStatic = (HDC)wp;
         HWND hwndStatic = (HWND)lp;
-        
-        if (GetDlgCtrlID(hwndStatic) == IDC_WARNING_GLYPH) {
-            SetTextColor(hdcStatic, RGB(220, 20, 20)); 
-            SetBkMode(hdcStatic, TRANSPARENT);
-            return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
-        }
-        break;
+        EnsureWhiteBrush();
+        SetBkMode(hdcStatic, TRANSPARENT);
+        if (GetDlgCtrlID(hwndStatic) == IDC_WARNING_GLYPH)
+            SetTextColor(hdcStatic, RGB(220, 20, 20));
+        return (INT_PTR)g_whiteBrush;
     }
     }
     
@@ -309,6 +364,22 @@ static INT_PTR CALLBACK PageSlidersProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 static INT_PTR CALLBACK PageOptionsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    // Same white-page treatment as PageSlidersProc: dialog body, plain
+    // statics (Color Theme / Profiles / Glyph Rendering titles, "Preset:")
+    // and the AUTOCHECKBOX controls (which are buttons, so they get their
+    // own CTLCOLORBTN message rather than CTLCOLORSTATIC) all route through
+    // the same white brush.
+    case WM_CTLCOLORDLG:
+        EnsureWhiteBrush();
+        return (INT_PTR)g_whiteBrush;
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        EnsureWhiteBrush();
+        if (msg == WM_CTLCOLORSTATIC) SetBkMode((HDC)wp, TRANSPARENT);
+        return (INT_PTR)g_whiteBrush;
+    }
+
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_BLOOM:
@@ -433,6 +504,7 @@ static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         g_page1 = CreateDialogParamW(g_inst, MAKEINTRESOURCEW(IDD_PAGE_SLIDERS), dlg, PageSlidersProc, 0);
         g_page2 = CreateDialogParamW(g_inst, MAKEINTRESOURCEW(IDD_PAGE_OPTIONS), dlg, PageOptionsProc, 0);
         PositionPages(dlg);
+        BoldenTitles(dlg);
         ControlsFromSettings(*s_set);
         ShowPage(0);
 
@@ -485,6 +557,8 @@ static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         StopPreview(dlg);
         g_page1 = nullptr;
         g_page2 = nullptr;
+        if (g_boldFont) { DeleteObject(g_boldFont); g_boldFont = nullptr; }
+        if (g_whiteBrush) { DeleteObject(g_whiteBrush); g_whiteBrush = nullptr; }
         break;
     }
     return FALSE;

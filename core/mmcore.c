@@ -10,7 +10,7 @@ static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 MMSettings mm_settings_default(void) {
     MMSettings s;
     s.density = 0.90;
-    s.speed = 0.25;
+    s.speed = 0.35;
     s.bloomIntensity = 0.90;
     s.glyphScale = 0.3f;
     s.lengthBias = 0.25;
@@ -161,12 +161,14 @@ struct MMSim {
     int        count;     
     int        cap;       
     int        cellCap;
+    int        laneCap;    // Safely track array capacity independently of aspect shifts
     MMColumn  *cols;
     int       *cells;     
     int       *cellBlank; 
     float     *cellFlipsX; 
     float     *cellFlipsY; 
     float     *lane_tails;
+    float     *lane_speeds; // Prevent fadeout overlap dynamically
     MMColSortItem *colSortBuf;
     MMSettings settings;
     float      lengthLUT[LUT_SIZE]; 
@@ -271,6 +273,8 @@ static void spawn_column(MMSim *sim, int i, int initial) {
     float depthNear = w->depthNear - sim->cameraTravel;
     int lane = -1;
     int start_lane = irange(&sim->rng, 0, sim->num_lanes - 1);
+    
+    // Find an open lane (gap requirement: tail must be at least 5 units below spawn top)
     for (int l = 0; l < sim->num_lanes; ++l) {
         int check_lane = (start_lane + l) % sim->num_lanes;
         if (get_lane_tail_y(sim, check_lane) < (w->topY - 5.0f)) {
@@ -345,7 +349,8 @@ static void spawn_column(MMSim *sim, int i, int initial) {
         fill_glyph_cell(sim, rowBase + j, j);
     }
 
-    c->wavePhase = (float)i * 0.35f + frange(&sim->rng, -0.12f, 0.12f);
+    // Sync phase to the lane so columns sharing a lane accelerate/decelerate in perfect unison
+    c->wavePhase = (float)c->lane * 0.35f;
     c->hueBias = frange(&sim->rng, -1.0f, 1.0f) * 0.15f;
 
     if (initial) {
@@ -360,11 +365,43 @@ static void spawn_column(MMSim *sim, int i, int initial) {
     } else {
         float randomDelay = frange(&sim->rng, 2.0f, 40.0f);
         c->headY = w->topY + (randomDelay * w->spacing);
+        
+        // Anti-overlap fadeout calculation: mathematically prevent new fast columns 
+        // from catching up to old slower columns in the same lane before they exit.
+        if (sim->lane_tails[lane] > -9000.0f) {
+            float old_tail = sim->lane_tails[lane];
+            float old_speed = sim->lane_speeds[lane];
+
+            // Target the TRUE exit plane (bottom of screen minus the tail length padding)
+            float y_dead = w->bottomY - (2.0f * w->spacing);
+            float old_dist = old_tail - y_dead;
+            
+            if (old_dist > 0.0f && old_speed > 0.01f) {
+                float old_time = old_dist / old_speed;
+                float new_dist = c->headY - y_dead;
+                float max_safe_speed = (new_dist / old_time) * 0.98f; // 2% safety margin
+                
+                if (c->speedVariation > max_safe_speed) {
+                    float min_acceptable_speed = 0.65f;
+                    if (max_safe_speed < min_acceptable_speed) {
+                        // Instead of breaking the speed limit, push the spawn further up!
+                        c->speedVariation = min_acceptable_speed;
+                        float required_new_dist = (min_acceptable_speed * old_time) / 0.98f;
+                        c->headY = y_dead + required_new_dist;
+                    } else {
+                        c->speedVariation = max_safe_speed;
+                    }
+                    c->baseSpeed = c->speedVariation; // keep in sync
+                }
+            }
+        }
     }
     
+    // Update lane tail/speed for the next column that checks this lane
     float tailY = c->headY + (c->length * w->spacing);
     if (tailY > sim->lane_tails[c->lane]) {
         sim->lane_tails[c->lane] = tailY;
+        sim->lane_speeds[c->lane] = c->speedVariation;
     }
 }
 
@@ -372,29 +409,34 @@ static void rebuild_columns(MMSim *sim, int count) {
     if (count < 0) count = 0;
     int neededCells = count * sim->slotCount;
     
-    if (count > sim->cap || neededCells > sim->cellCap) {
+    // Expand capacity safely independently of aspect shifts
+    if (count > sim->cap || neededCells > sim->cellCap || sim->num_lanes > sim->laneCap) {
         if (sim->cols) free(sim->cols);
         if (sim->cells) free(sim->cells);
         if (sim->cellBlank) free(sim->cellBlank);
         if (sim->cellFlipsX) free(sim->cellFlipsX); 
         if (sim->cellFlipsY) free(sim->cellFlipsY); 
         if (sim->lane_tails) free(sim->lane_tails);
+        if (sim->lane_speeds) free(sim->lane_speeds);
         if (sim->colSortBuf) free(sim->colSortBuf); 
         
         sim->cap = count;
         sim->cellCap = neededCells;
+        sim->laneCap = sim->num_lanes;
         
         sim->cols  = (MMColumn *)malloc(sizeof(MMColumn) * (size_t)sim->cap);
         sim->cells = (int *)malloc(sizeof(int) * (size_t)sim->cellCap);
         sim->cellBlank = (int *)malloc(sizeof(int) * (size_t)sim->cellCap);
         sim->cellFlipsX = (float *)malloc(sizeof(float) * (size_t)sim->cellCap); 
         sim->cellFlipsY = (float *)malloc(sizeof(float) * (size_t)sim->cellCap); 
-        sim->lane_tails = (float *)malloc(sizeof(float) * sim->num_lanes);
+        sim->lane_tails = (float *)malloc(sizeof(float) * sim->laneCap);
+        sim->lane_speeds = (float *)malloc(sizeof(float) * sim->laneCap);
         sim->colSortBuf = (MMColSortItem *)malloc(sizeof(MMColSortItem) * (size_t)sim->cap); 
     }
     
     for (int l = 0; l < sim->num_lanes; ++l) {
         sim->lane_tails[l] = -9999.0f;
+        sim->lane_speeds[l] = 0.0f;
     }
     
     sim->count = 0;
@@ -416,12 +458,14 @@ MMSim *mm_sim_create(const MMSettings *s, int glyphCount, uint64_t seed, float a
 
     sim->count = 0;
     sim->cap = 0;
+    sim->laneCap = 0;
     sim->cols = NULL;
     sim->cells = NULL;
     sim->cellBlank = NULL;
     sim->cellFlipsX = NULL; 
     sim->cellFlipsY = NULL; 
     sim->lane_tails = NULL;
+    sim->lane_speeds = NULL;
     sim->colSortBuf = NULL;
     sim->settings = *s; 
     refresh_sim_settings(sim);
@@ -441,6 +485,7 @@ void mm_sim_destroy(MMSim *sim) {
     free(sim->cellFlipsX); 
     free(sim->cellFlipsY); 
     free(sim->lane_tails);
+    free(sim->lane_speeds);
     free(sim->colSortBuf);
     free(sim);
 }
@@ -539,13 +584,18 @@ void mm_sim_advance(MMSim *sim, float dt) {
     const float fall = mm_fall_speed(&sim->settings);
     const MMWorld *w = &sim->world;
 
-    for (int l = 0; l < sim->num_lanes; ++l) sim->lane_tails[l] = -9999.0f;
+    for (int l = 0; l < sim->num_lanes; ++l) {
+        sim->lane_tails[l] = -9999.0f;
+        sim->lane_speeds[l] = 0.0f;
+    }
+    
     for (int i = 0; i < sim->count; ++i) {
         MMColumn *c = &sim->cols[i];
         if (c->lane != -1) {
             float tailY = c->headY + (c->length * w->spacing);
             if (tailY > sim->lane_tails[c->lane]) {
                 sim->lane_tails[c->lane] = tailY;
+                sim->lane_speeds[c->lane] = c->speedVariation;
             }
         }
     }
@@ -582,24 +632,28 @@ void mm_sim_advance(MMSim *sim, float dt) {
             
             float exactHeadSlot = (w->topY - c->yOff - c->headY) / w->spacing;
             int currentHeadSlot = (int)exactHeadSlot;
+            float invLength = 1.0f / (float)c->length; // Perf optimization
 
             for (int slot = lo; slot <= hi; ++slot) {
                 float perCharProb = baseProb;
                 
                 float distToHead = (float)currentHeadSlot - (float)slot;
-                float t = distToHead / (float)c->length;
+                float t = distToHead * invLength; // using hoisted division
                 if (t < 0.0f) t = 0.0f;
                 if (t > 1.0f) t = 1.0f;
                 
                 float visualEnergy = mm_column_brightness_curve(t);
 
-                if (visualEnergy < 0.08f) {
+                // 5% more aggressive freeze gate logic
+                const float kFreezeFloor = 0.084f;
+
+                if (visualEnergy < kFreezeFloor) {
                     perCharProb = 0.0f;
                 } else {
                     if (c->isGlitch) {
                         perCharProb *= 20.0f;
                     } else {
-                        float normalizedEnergy = (visualEnergy - 0.08f) / 0.92f;
+                        float normalizedEnergy = (visualEnergy - kFreezeFloor) / (1.0f - kFreezeFloor);
                         perCharProb *= powf(normalizedEnergy, 3.0f) * 4.0f; 
                     }
                 }
@@ -728,6 +782,7 @@ int mm_sim_write_instances(MMSim *sim, MMGlyphInstance *out, int max_instances, 
         float exactHeadSlot = (w->topY - c->yOff - interpolatedHeadY) / w->spacing;
         int headSlot = (int)exactHeadSlot;
         float fraction = exactHeadSlot - (float)headSlot; 
+        float invLength = 1.0f / (float)c->length; // Perf optimization
 
         float hueDrift = sinf(exactTime * 0.04f + c->wavePhase * 1.3f) * 0.05f;
         float hue = c->hueBias + hueDrift;
@@ -758,7 +813,7 @@ int mm_sim_write_instances(MMSim *sim, MMGlyphInstance *out, int max_instances, 
 
                 float distToHead = (float)headSlot - (float)slot;
 
-                float t = (exactHeadSlot - (float)slot) / (float)c->length;
+                float t = (exactHeadSlot - (float)slot) * invLength; // using hoisted division
                 float falloff = mm_column_brightness_curve(t);
 
                 float baseBright = falloff * glowNoise;
